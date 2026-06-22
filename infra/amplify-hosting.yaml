@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Deploy the profilesapp repository to AWS Amplify Hosting.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: profilesapp
+    Description: Name of the Amplify Hosting app.
+  Repository:
+    Type: String
+    Default: https://github.com/pojir/profilesapp
+    Description: GitHub repository URL to connect to Amplify Hosting.
+  BranchName:
+    Type: String
+    Default: main
+    Description: Git branch to build and deploy.
+  GitHubAccessToken:
+    Type: String
+    NoEcho: true
+    MinLength: 1
+    Description: GitHub personal access token used once by Amplify to install or authorize the GitHub App.
+
+Resources:
+  AmplifyServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-amplify-service-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: amplify.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmplifyBackendDeployFullAccess
+      Tags:
+        - Key: Application
+          Value: !Ref AppName
+
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: !Ref AppName
+      Description: !Sub "Amplify Hosting app for ${Repository}"
+      Repository: !Ref Repository
+      AccessToken: !Ref GitHubAccessToken
+      IAMServiceRole: !GetAtt AmplifyServiceRole.Arn
+      Platform: WEB
+      EnableBranchAutoDeletion: true
+      BuildSpec: |
+        version: 1
+        backend:
+          phases:
+            build:
+              commands:
+                - npm install
+                - npx ampx pipeline-deploy --branch $AWS_BRANCH --app-id $AWS_APP_ID
+        frontend:
+          phases:
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            baseDirectory: dist
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - node_modules/**/*
+      Tags:
+        - Key: Application
+          Value: !Ref AppName
+
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: !Ref BranchName
+      Description: !Sub "Auto-built ${BranchName} branch for ${AppName}"
+      EnableAutoBuild: true
+      EnablePullRequestPreview: false
+      Framework: React
+      Stage: PRODUCTION
+      Tags:
+        - Key: Application
+          Value: !Ref AppName
+
+  StartBuildFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-amplify-start-build-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StartAmplifyBuild
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - amplify:StartJob
+                Resource: "*"
+      Tags:
+        - Key: Application
+          Value: !Ref AppName
+
+  StartBuildFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AppName}-amplify-start-build"
+      Description: Starts the first Amplify Hosting build after CloudFormation creates the branch.
+      Handler: index.handler
+      Role: !GetAtt StartBuildFunctionRole.Arn
+      Runtime: python3.12
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import urllib.request
+
+          amplify = boto3.client("amplify")
+
+          def send(event, context, status, data=None, reason=None):
+              body = {
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch Logs: {context.log_stream_name}",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or f"{event['ResourceProperties']['AppId']}-{event['ResourceProperties']['BranchName']}-build",
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False,
+                  "Data": data or {},
+              }
+              response_body = json.dumps(body).encode("utf-8")
+              request = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=response_body,
+                  method="PUT",
+                  headers={"content-type": "", "content-length": str(len(response_body))},
+              )
+              urllib.request.urlopen(request)
+
+          def handler(event, context):
+              try:
+                  props = event["ResourceProperties"]
+                  app_id = props["AppId"]
+                  branch_name = props["BranchName"]
+
+                  if event["RequestType"] == "Delete":
+                      send(event, context, "SUCCESS")
+                      return
+
+                  response = amplify.start_job(
+                      appId=app_id,
+                      branchName=branch_name,
+                      jobType="RELEASE",
+                      jobReason=f"CloudFormation {event['RequestType']} for {event['StackId']}",
+                  )
+                  send(event, context, "SUCCESS", {"JobId": response["jobSummary"]["jobId"]})
+              except Exception as error:
+                  send(event, context, "FAILED", reason=str(error))
+      Tags:
+        - Key: Application
+          Value: !Ref AppName
+
+  StartBranchBuild:
+    Type: Custom::AmplifyStartBuild
+    DependsOn: AmplifyBranch
+    Properties:
+      ServiceToken: !GetAtt StartBuildFunction.Arn
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: !Ref BranchName
+
+Outputs:
+  AppId:
+    Description: Amplify app ID.
+    Value: !GetAtt AmplifyApp.AppId
+  AppArn:
+    Description: Amplify app ARN.
+    Value: !GetAtt AmplifyApp.Arn
+  DefaultDomain:
+    Description: Amplify default domain for the app.
+    Value: !GetAtt AmplifyApp.DefaultDomain
+  BranchUrl:
+    Description: Default URL for the deployed branch.
+    Value: !Sub "https://${BranchName}.${AmplifyApp.DefaultDomain}"
+  InitialBuildJobId:
+    Description: Amplify job ID started by CloudFormation.
+    Value: !GetAtt StartBranchBuild.JobId
+  Region:
+    Description: Region where this stack was deployed.
+    Value: !Ref AWS::Region
